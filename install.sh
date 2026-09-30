@@ -27,7 +27,7 @@ jq --argjson f "$FRAG" '
     | ($cur | map(.hooks[0].command)) as $have
     | .hooks[$ev] = $cur + [ $f.hooks[$ev][] | select(.hooks[0].command as $c | $have | index($c) | not) ];
   .env = ((.env // {}) + $f.env)
-  | addhooks("PreToolUse") | addhooks("Stop")
+  | reduce ($f.hooks | keys_unsorted[]) as $ev (.; addhooks($ev))
 ' "$SETTINGS.bak-duo" > "$SETTINGS.tmp"            # never write directly: a jq failure must not truncate settings
 jq -e . "$SETTINGS.tmp" >/dev/null && mv "$SETTINGS.tmp" "$SETTINGS"
 jq -e '.hooks.PreToolUse[]|select(.matcher=="ExitPlanMode")' "$SETTINGS" >/dev/null && echo "ok: hooks registered in $SETTINGS (backup: $SETTINGS.bak-duo)"

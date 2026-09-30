@@ -5,12 +5,29 @@ Two-model workflow for Claude Code: Claude plans and implements, Cursor (GPT/Cod
 ```
 you: "implement X"  (Claude in plan mode)
   └─ Claude writes plan → ExitPlanMode
-       └─ hook: Cursor reviews plan  → REVISE: denied, Claude edits plan, retries (max 3)
+       └─ hook: Cursor reviews plan  → [BLOCKER]: denied, Claude edits plan, retries (max 3 rounds)
+                                     → [ESCALATE] only: denied once, Claude asks you, records the decision
                                      → APPROVE: Claude implements
             └─ Claude stops
-                 └─ hook: Cursor reviews diff → CHANGES: stop blocked, Claude verifies + fixes, stops again (max 3)
+                 └─ hook: Cursor reviews diff → [BLOCKER]: stop blocked, Claude verifies + fixes, stops again (max 3)
+                                              → [ESCALATE] only: Claude asks you (no round used)
                                               → LGTM: done, diff left unstaged
 ```
+
+## Findings, verdicts and rounds
+
+- Cursor tags every finding `[BLOCKER]`, `[SHOULD]`, `[NIT]` or `[ESCALATE]`. Only a blocker makes Claude change the
+  work before continuing; `[SHOULD]`/`[NIT]` are optional and shown to you; `[ESCALATE]` (a product/scope/ops
+  trade-off, or a disagreement that Claude's answer did not settle) goes to you through Claude's AskUserQuestion.
+- A **valid** answer has the verdict word alone on a line near the top (`APPROVE`/`REVISE`, `LGTM`/`CHANGES`);
+  Cursor is told to answer with that single word when there is nothing to change. An empty or verdict-less answer
+  is retried once. If the retry fails too, Claude is stopped once and told to tell you the review did not happen
+  (no round used, no loop). Each call is capped at `DUO_AGENT_TIMEOUT` and logged with exit code and duration in
+  `/tmp/claude-duo-<session>-answers.log`.
+- Rounds are counted per request: only a review with a `[BLOCKER]` uses one, the counter resets on approval and
+  whenever you send a new message, and at the cap it stays capped until one of those happens.
+- Between rounds Cursor gets its previous findings plus Claude's reply (what was fixed, why the rest was rejected),
+  so a rejected point is not repeated without new evidence; a real disagreement becomes `[ESCALATE]`.
 
 ## What each reviewer is told
 
@@ -20,9 +37,19 @@ Every Cursor call is a fresh session (no `--resume`), so each prompt carries its
 |---|---|---|---|
 | `TASK TITLE` | yes | yes | session title (`customTitle`, else `aiTitle`) |
 | `ORIGINAL REQUEST` | yes | yes | your first message this session — survives truncation |
-| `TASK CONTEXT` | yes | yes | all your typed messages, in order (tool output, skills and system reminders filtered out) |
-| `APPROVED PLAN` | — | yes | cached when the plan review returns APPROVE, so the code is checked against what was agreed |
+| `TEAM REVIEW GUIDE` | yes | yes | `$DUO_HOME/review-guide.md` (see below) |
+| `TASK CONTEXT` | yes | yes | your typed messages, a placeholder for each attached image, and your answers to Claude's AskUserQuestion prompts, in order (tool output, skills, system reminders and hook feedback filtered out) |
+| `APPROVED PLAN` | — | yes | cached when the plan review approves; the plan starts with the ticket's requirements verbatim (images transcribed by Claude), so the diff is checked against them |
+| `PREVIOUS ROUND` | yes | yes | Cursor's findings from the last round of this request + Claude's latest reply |
 | `PLAN` / `DIFF` | the plan | `git diff` + untracked files | |
+
+### Team review guide
+
+`$DUO_HOME/review-guide.md` (override with `DUO_REVIEW_GUIDE`) holds how the human reviewers of every repo under
+`DUO_HOME` review MRs: requirements and sibling code paths, failure modes, blast radius, transactions, tests,
+simplicity, logging, conventions, with repo-specific items labelled. Cursor only auto-loads `AGENTS.md`,
+`CLAUDE.md` and `.cursor/rules` of the repo it runs in, so the hooks paste the guide into both prompts. Grow it
+from real review threads; a missing file just drops the section.
 
 ## Files
 
@@ -32,6 +59,8 @@ Every Cursor call is a fresh session (no `--resume`), so each prompt carries its
 | `hooks/review-plan.sh` | `PreToolUse` on `ExitPlanMode` |
 | `hooks/review-diff.sh` | `Stop` — reviews `git diff` + untracked files |
 | `hooks/block-git-staging.sh` | `PreToolUse` on `Bash` — denies `git add/commit/stash/push/reset/restore` while duo is on |
+| `hooks/mark-aside.sh` | `UserPromptSubmit` - marks a `/btw` turn so the Stop hook skips the review |
+| `skills/btw` | `/btw` - same marker as a slash command, and tells Claude to answer without implementing |
 | `skills/duo-on`, `skills/duo-off` | `/duo-on` `/duo-off` — create/remove the marker file and brief Claude on the rules |
 | `hooks.settings.json` | fragment merged into `~/.claude/settings.json` by the installer |
 | `statusline-duo.snippet.sh` | adds ` \| DUO` to the status line while active (superseded by `../statusline-command.sh`) |
@@ -100,12 +129,17 @@ Set in `~/.claude/settings.json` → `env`:
 | `DUO_PLAN_MODEL` | `grok-4.7-high` | model for the plan review (approach, fit, missing requirements) |
 | `DUO_DIFF_MODEL` | `grok-4.7-high` | model for the diff review (bugs, contracts, tests) |
 | `DUO_MODEL` | `grok-4.7-high` | fallback used for either review when the two above are unset |
+| `DUO_ASIDE_RE` | `^\s*/?btw(\s\|,\|:\|$)` | message prefix that marks a turn as an aside |
+| `DUO_ASIDE_CHARS` | `4000` | max chars of recorded side discussion passed to a reviewer |
 | `DUO_MAX_ROUNDS` | `3` | cap for plan rounds and, separately, diff rounds |
 | `DUO_CTX_CHARS` | `12000` | max chars of your own messages forwarded to Cursor (most recent kept; truncation is marked) |
 | `DUO_TASK_CHARS` | `2000` | max chars of the opening request quoted in the task header |
 | `DUO_PROMPT_LOG` | unset | file to append every prompt sent to Cursor — for debugging what a reviewer actually saw |
+| `DUO_REVIEW_GUIDE` | `$DUO_HOME/review-guide.md` | team review guide pasted into both prompts |
+| `DUO_REPLY_CHARS` | `6000` | max chars of Claude's latest reply passed to the next round |
+| `DUO_AGENT_TIMEOUT` | `1500` | seconds per Cursor call, below the 1800 s hook timeouts, so a slow reviewer is reported; a timed-out call is not retried |
 
-Round counters live in `/tmp/claude-duo-<session>-*`; delete them to reset a session.
+Round counters, the last review and escalation flags live in `/tmp/claude-duo-<session>-*`; delete them to reset a session.
 
 ## Uninstall
 
@@ -120,6 +154,31 @@ Remove the three hook entries and the `env` keys from `~/.claude/settings.json` 
 - `-fast` variants buy little here — hooks run while you wait anyway.
 - Usage limits are per-family on Cursor plans: if one family is exhausted, another may still work (`agent -p --model <id> "Reply OK"` is a cheap probe).
 - Notable families: Codex 5.3 (code-specialised), GPT-5.6 Sol/Terra/Luna (1M general), GPT-5.5/5.4/5.2, Grok 4.7/4.6, Gemini Flash, Kimi, GLM.
+
+## Asides (`/btw`)
+
+A side question during implementation - a decision, a clarification, "why did you do it that way" - should not spend
+a Cursor call on a half-finished diff.
+
+Start the message with `/btw` (or plain `btw,`): Claude answers, and that turn's Stop hook skips the Cursor review
+and the prose gate without consuming a round. The diff stays unreviewed, so the next ordinary turn sends it to
+Cursor as usual - nothing is skipped permanently.
+
+The discussion is not lost either. Your own messages already reach a reviewer through `TASK CONTEXT`; on an aside
+turn the hook additionally records Claude's answer, and both reviews then carry a `SIDE DISCUSSION` block telling
+the reviewer to treat decisions settled there as agreed - and to flag anything in the plan or diff that contradicts
+them.
+
+Two paths set the same one-turn flag, so it works however you type it: the `UserPromptSubmit` hook matches
+`DUO_ASIDE_RE` against the raw message, and the `/btw` skill sets a fallback flag and tells Claude to answer rather
+than implement.
+
+## Prose (Claude-side)
+
+Non-code text is not part of the Cursor loop. `/duo-on` tells Claude to run the `no-ai-slop` skill over the prose it
+wrote or changed as a step of implementing, after the tests pass and before it stops, so Cursor reviews the finished
+change and knows nothing about the skill. `no-ai-slop` is a user-level skill in `~/.claude/skills/`, not part of
+this package.
 
 ## Status line
 

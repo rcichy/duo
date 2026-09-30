@@ -1,12 +1,54 @@
 {
-  "env": { "DUO_HOME": "__DUO_HOME__", "DUO_PLAN_MODEL": "grok-4.7-high", "DUO_DIFF_MODEL": "grok-4.7-high", "DUO_MAX_ROUNDS": "3" },
+  "env": {
+    "DUO_HOME": "__DUO_HOME__",
+    "DUO_PLAN_MODEL": "grok-4.7-high",
+    "DUO_DIFF_MODEL": "grok-4.7-high",
+    "DUO_MAX_ROUNDS": "3"
+  },
   "hooks": {
     "PreToolUse": [
-      { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": "__HOME__/.config/ai/duo/hooks/review-plan.sh", "timeout": 600, "statusMessage": "duo: Cursor is reviewing the plan…" } ] },
-      { "matcher": "Bash",         "hooks": [ { "type": "command", "command": "__HOME__/.config/ai/duo/hooks/block-git-staging.sh" } ] }
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.config/ai/duo/hooks/review-plan.sh",
+            "timeout": 1800,
+            "statusMessage": "duo: Cursor is reviewing the plan\u2026"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.config/ai/duo/hooks/block-git-staging.sh"
+          }
+        ]
+      }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "__HOME__/.config/ai/duo/hooks/review-diff.sh", "timeout": 900, "statusMessage": "duo: Cursor is reviewing the diff…" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.config/ai/duo/hooks/review-diff.sh",
+            "timeout": 1800,
+            "statusMessage": "duo: Cursor is reviewing the diff\u2026"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.config/ai/duo/hooks/mark-aside.sh"
+          }
+        ]
+      }
     ]
   }
 }

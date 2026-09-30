@@ -25,24 +25,87 @@ DUO_DIFF_MODEL="${DUO_DIFF_MODEL:-$DUO_MODEL}"        # diff review: code-level 
 DUO_MAX_ROUNDS="${DUO_MAX_ROUNDS:-3}"
 DUO_STATE="/tmp/claude-duo-$DUO_SESSION"
 
-# duo_round <name>  -> prints the round number after incrementing, or "cap" if exhausted
-duo_round() {
-  local f="$DUO_STATE-$1-rounds" n
-  n=$(cat "$f" 2>/dev/null || echo 0)
-  if [ "$n" -ge "$DUO_MAX_ROUNDS" ]; then rm -f "$f"; echo cap; return; fi
-  echo $((n+1)) | tee "$f"
+# Rounds are counted per user request: a new user message resets them, and only a valid review that
+# blocks consumes one. A reviewer that returns nothing (usage limit, crash) never burns a round.
+# State file "$DUO_STATE-<name>-rounds" holds "<rounds used> <user message count when counted>".
+
+# duo_round_status <name> -> rounds already used for the current request, or "cap" when exhausted
+duo_round_status() {
+  local f="$DUO_STATE-$1-rounds" n=0 turns saved
+  turns=$(duo_user_turns)
+  if [ -f "$f" ] && read -r n saved < "$f" && [ "$saved" != "$turns" ]; then
+    duo_reset_round "$1"; n=0
+  fi
+  if [ "${n:-0}" -ge "$DUO_MAX_ROUNDS" ]; then echo cap; else echo "${n:-0}"; fi
 }
-duo_reset_round() { rm -f "$DUO_STATE-$1-rounds"; }
+
+# duo_round_consume <name> -> records one more used round, prints its number
+duo_round_consume() {
+  local f="$DUO_STATE-$1-rounds" n=0 saved
+  [ -f "$f" ] && read -r n saved < "$f"
+  n=$(( ${n:-0} + 1 ))
+  echo "$n $(duo_user_turns)" > "$f"
+  echo "$n"
+}
+
+duo_reset_round() { rm -f "$DUO_STATE-$1-rounds" "$DUO_STATE-$1-last-review" "$DUO_STATE-$1-escalated"; }
+
+# duo_verdict <review> <word>... -> the verdict word from the first line that consists of one of them alone
+# (markdown emphasis and punctuation ignored, a short preamble before it tolerated); nothing when no line does.
+duo_verdict() {
+  local review="$1" line w; shift
+  while IFS= read -r line; do
+    line=$(tr -d '*`#.:[:space:]' <<<"$line" | tr '[:lower:]' '[:upper:]')
+    for w in "$@"; do [ "$line" = "$w" ] && { echo "$w"; return 0; }; done
+  done < <(printf '%s\n' "$review" | head -20)
+  return 0
+}
+
+# duo_has_tag <review> <TAG> -> success when a finding carries [TAG]
+duo_has_tag() { grep -qiF "[$2]" <<<"$1"; }
+
+# duo_failure_reason -> why the last Cursor call gave no usable review (after the retry), for the user
+duo_failure_reason() {
+  local answer; answer=$(sed 1d "$DUO_STATE-last-answer" 2>/dev/null)
+  if [ -z "$(tr -d '[:space:]' <<<"$answer")" ]; then duo_why_empty
+  else printf 'no verdict line in the answer: %s' "$(head -c 300 <<<"$answer" | tr '\n' ' ')"
+  fi
+  printf ' (details: %s)' "$DUO_STATE-last-answer"
+}
 
 # duo_ask <model> <prompt>  -> runs Cursor (read-only) in the repo root, prints its answer.
 # Each call is a fresh Cursor session: nothing is threaded between rounds or between the two reviews,
 # so anything a reviewer must know has to be in the prompt.
+# Every call leaves its raw answer, exit code and duration in "$DUO_STATE-last-answer" (and appends it to
+# "$DUO_STATE-answers.log") for diagnosis. The call is
+# capped below the hook timeouts (1800s) so a slow reviewer is reported instead of silently killed.
+DUO_AGENT_TIMEOUT="${DUO_AGENT_TIMEOUT:-1500}"
 duo_ask() {
-  local model="$1" prompt="$2" out
+  local model="$1" prompt="$2" out rc start limit=()
   [ -n "${DUO_PROMPT_LOG:-}" ] && printf '===== %s =====\n%s\n' "$model" "$prompt" >> "$DUO_PROMPT_LOG"
-  out=$(cd "$DUO_ROOT" && agent -p --trust --mode ask --model "$model" --output-format text "$prompt" 2>"$DUO_STATE-stderr")
+  command -v timeout >/dev/null 2>&1 && limit=(timeout "$DUO_AGENT_TIMEOUT")
+  start=$(date +%s)
+  out=$(cd "$DUO_ROOT" && "${limit[@]}" agent -p --trust --mode ask --model "$model" --output-format text "$prompt" 2>"$DUO_STATE-stderr")
+  rc=$?
+  [ "$rc" = 124 ] && printf 'agent timed out after %ss\n' "$DUO_AGENT_TIMEOUT" >> "$DUO_STATE-stderr"
+  printf '===== %s model=%s rc=%s %ss prompt=%s chars =====\n%s\n' "$(date '+%F %T')" "$model" "$rc" \
+    "$(( $(date +%s) - start ))" "${#prompt}" "$out" > "$DUO_STATE-last-answer"
+  cat "$DUO_STATE-last-answer" >> "$DUO_STATE-answers.log"
   duo_record_cursor "$model" "$out"
   printf '%s' "$out"
+}
+
+# duo_review <model> <prompt> <verdict words>... -> a review with a recognisable verdict, asking a second time when
+# the first answer came back empty or without one; a timeout is not retried (a second call would outlive the hook).
+# Prints nothing when no usable review was obtained.
+duo_review() {
+  local model="$1" prompt="$2" review; shift 2
+  review=$(duo_ask "$model" "$prompt")
+  if [ -z "$(duo_verdict "$review" "$@")" ] && ! grep -q "timed out" "$DUO_STATE-stderr" 2>/dev/null; then
+    review=$(duo_ask "$model" "$prompt")
+  fi
+  [ -n "$(duo_verdict "$review" "$@")" ] && printf '%s' "$review"
+  return 0
 }
 
 # duo_record_cursor <model> <output> -> note whether this model answered or is rate-limited.
@@ -75,16 +138,46 @@ duo_why_empty() {
   [ -s "$DUO_STATE-stderr" ] && head -c 300 "$DUO_STATE-stderr" | tr '\n' ' ' || echo "no output and no error from 'agent' — check: agent login"
 }
 
-# duo_user_context -> the user's own typed messages from this session's transcript, in order
-# (skips tool results, skill expansions and <system-reminder> blocks; capped at DUO_CTX_CHARS)
 DUO_CTX_CHARS="${DUO_CTX_CHARS:-12000}"
 DUO_TASK_CHARS="${DUO_TASK_CHARS:-2000}"
-duo_user_context() {
+DUO_REPLY_CHARS="${DUO_REPLY_CHARS:-6000}"
+
+# duo_user_entries -> one JSON object per line, in transcript order: {k:"msg"|"img"|"answer", t:text}
+#   msg    = text the user typed (string messages, text blocks of messages with attachments, and messages
+#            sent while Claude was working, stored as queued_command attachments)
+#   img    = an image the user attached (Cursor cannot see it; Claude transcribes it into the plan)
+#   answer = the user's answer to a question Claude asked with AskUserQuestion
+# Skips tool output, meta entries (skill expansions, image paths), <system-reminder> blocks and
+# "Stop hook feedback" (the previous round is passed separately).
+duo_user_entries() {
   local t; t=$(jq -r '.transcript_path // empty' <<<"$DUO_INPUT")
   [ -f "$t" ] || return 0
+  jq -c 'def typed: select(startswith("<")|not) | select(startswith("Stop hook feedback")|not);
+    if .type=="attachment" and .attachment.type? == "queued_command" then
+      (.attachment.prompt? // empty | strings | typed | {k:"msg", t:.})
+    else
+    select(.type=="user") | (.isMeta == true) as $meta | .message.content as $c
+    | if ($c|type)=="string" then ($c | select($meta|not) | typed | {k:"msg", t:.})
+      else $c[]?
+        | if .type=="text" then (.text | select($meta|not) | typed | {k:"msg", t:.})
+          elif .type=="image" and ($meta|not) then {k:"img", t:"[image attached — Claude must transcribe it into the plan Requirements section]"}
+          elif .type=="tool_result" then
+            ((.content | if type=="array" then (map(.text? // "") | join("")) else tostring end)
+             | select(test("^(The user answered|User has answered)")) | {k:"answer", t:.})
+          else empty end
+      end
+    end' "$t" 2>/dev/null
+}
+
+# duo_user_turns -> number of messages the user typed so far (a new one starts a new request)
+duo_user_turns() { duo_user_entries | jq -s '[.[] | select(.k=="msg")] | length'; }
+
+# duo_user_context -> the user's messages, attachments and answers from this session, in order
+# (capped at DUO_CTX_CHARS, most recent kept)
+duo_user_context() {
   local all
-  all=$(jq -r 'select(.type=="user" and (.message.content|type)=="string")
-               | .message.content | select(startswith("<")|not) | "> " + . + "\n"' "$t" 2>/dev/null)
+  all=$(duo_user_entries | jq -r 'if .k=="answer" then "> [user answered a question from Claude] " + .t
+                                   else "> " + .t end + "\n"')
   if [ "${#all}" -gt "$DUO_CTX_CHARS" ]; then
     printf '[...earlier messages omitted; the original request is quoted above...]\n%s' \
       "$(printf '%s' "$all" | tail -c "$DUO_CTX_CHARS")"
@@ -111,3 +204,142 @@ duo_task_header() {
 
 # the approved plan is cached here by review-plan.sh and read back by review-diff.sh
 DUO_PLAN_CACHE="$DUO_STATE-approved-plan"
+
+# --- asides ----------------------------------------------------------------------------------
+# A message opening with the aside marker is a side question (a decision, a "why did you ...").
+# Claude answers it, but the Stop hook skips the review for that turn: the diff is mid-implementation,
+# so reviewing it would waste a Cursor call and confuse the round counter.
+DUO_ASIDE_RE="${DUO_ASIDE_RE:-^[[:space:]]*/?btw([[:space:]]|,|:|$)}"
+DUO_ASIDE_FLAG="$DUO_STATE-aside"
+DUO_ASIDE_FLAG_GLOBAL="$DUO_HOME/.claude/duo-aside"   # set by the /btw skill, which has no session id
+
+# duo_aside_consume -> 0 when this turn is an aside; clears the mark so it lasts exactly one turn
+duo_aside_consume() {
+  if [ -f "$DUO_ASIDE_FLAG" ] || [ -f "$DUO_ASIDE_FLAG_GLOBAL" ]; then
+    rm -f "$DUO_ASIDE_FLAG" "$DUO_ASIDE_FLAG_GLOBAL"
+    return 0
+  fi
+  return 1
+}
+
+DUO_ASIDE_CHARS="${DUO_ASIDE_CHARS:-4000}"
+
+# duo_aside_record -> append this aside exchange (the question and Claude's answer) to the session log.
+# The user's message already reaches a reviewer through TASK CONTEXT; the answer is what would be lost,
+# and the answer is usually where the decision is.
+duo_aside_record() {
+  local q a f="$DUO_STATE-asides"
+  q=$(duo_user_entries | jq -r 'select(.k=="msg") | .t' 2>/dev/null | tail -1)
+  a=$(duo_last_claude_text)
+  [ -n "$q$a" ] || return 0
+  { [ -n "$q" ] && printf 'Q (user, asked alongside the work): %s\n' "$q"
+    [ -n "$a" ] && printf 'A (Claude): %s\n' "$a"
+    printf '\n'; } >> "$f"
+}
+
+# duo_aside_context -> the accumulated side discussion, for both review prompts
+duo_aside_context() {
+  local f="$DUO_STATE-asides"
+  [ -s "$f" ] || return 0
+  printf 'SIDE DISCUSSION — questions the user asked Claude alongside the implementation, with Claude'"'"'s answers.
+No review ran at the time. Treat decisions settled here as agreed context: do not re-litigate them, and do flag
+anything in the plan or diff that contradicts them.
+
+%s
+' "$(tail -c "$DUO_ASIDE_CHARS" "$f")"
+}
+
+# --- prose gate ------------------------------------------------------------------------------
+# Non-code text is reviewed by Claude with an editing skill, not by Cursor: Cursor is aimed at code,
+# and a prose pass costs a Cursor call it cannot spend well.
+DUO_PROSE_RE="${DUO_PROSE_RE:-\.(md|markdown|mdx|rst|txt|adoc)$}"
+DUO_PROSE_MIN_LINES="${DUO_PROSE_MIN_LINES:-5}"   # skip the pass for typo-sized prose changes
+DUO_PROSE_SKILL="${DUO_PROSE_SKILL:-no-ai-slop}"  # empty disables the gate
+
+# duo_prose_skill_available -> 0 when that skill is installed for this session
+duo_prose_skill_available() {
+  [ -n "$DUO_PROSE_SKILL" ] || return 1
+  [ -d "$HOME/.claude/skills/$DUO_PROSE_SKILL" ] && return 0
+  [ -d "$DUO_ROOT/.claude/skills/$DUO_PROSE_SKILL" ] && return 0
+  compgen -G "$HOME/.claude/plugins/*/skills/$DUO_PROSE_SKILL" >/dev/null 2>&1
+}
+
+# duo_prose_pending -> changed prose files not yet handed to the editing skill, one per line
+duo_prose_pending() {
+  local tracked untracked changed added=0 f
+  tracked=$(git diff --name-only 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
+  untracked=$(git ls-files --others --exclude-standard 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
+  changed=$(printf '%s\n%s\n' "$tracked" "$untracked" | sed '/^$/d' | sort -u)
+  [ -n "$changed" ] || return 0
+  added=$(git diff --numstat 2>/dev/null | grep -Ei "$DUO_PROSE_RE" | awk '{s+=$1} END{print s+0}')
+  while IFS= read -r f; do
+    [ -n "$f" ] && added=$(( added + $(wc -l < "$f" 2>/dev/null || echo 0) ))
+  done <<<"$untracked"
+  [ "${added:-0}" -ge "$DUO_PROSE_MIN_LINES" ] || return 0
+  comm -23 <(printf '%s\n' "$changed") <(sort -u "$DUO_STATE-prose-done" 2>/dev/null)
+}
+
+duo_prose_mark_done() { printf '%s\n' "$1" >> "$DUO_STATE-prose-done"; }
+
+# duo_last_claude_text -> Claude's most recent text reply (its accepted/rejected summary after a review)
+duo_last_claude_text() {
+  local t; t=$(jq -r '.transcript_path // empty' <<<"$DUO_INPUT")
+  [ -f "$t" ] || return 0
+  jq -rs '[.[] | select(.type=="assistant") | [.message.content[]? | select(.type=="text") | .text]
+           | join("\n") | select(length > 0)] | last // empty' "$t" 2>/dev/null | tail -c "$DUO_REPLY_CHARS"
+}
+
+# duo_save_review <name> <review> / duo_previous_round <name> -> reviewer memory between rounds
+duo_save_review() { printf '%s' "$2" > "$DUO_STATE-$1-last-review"; }
+duo_previous_round() {
+  local f="$DUO_STATE-$1-last-review"
+  [ -s "$f" ] || return 0
+  printf 'PREVIOUS ROUND — your findings from the last round, then Claude'"'"'s response (what it changed and why it rejected the rest).
+Do not repeat a finding Claude rejected unless you have new evidence, and state that evidence. If you still believe a
+rejected point matters and Claude'"'"'s reasoning does not convince you, tag it [ESCALATE] so the user decides.
+YOUR FINDINGS:
+%s
+
+CLAUDE'"'"'S RESPONSE:
+%s
+
+' "$(cat "$f")" "$(duo_last_claude_text)"
+}
+
+# duo_review_guide -> the team review guide shared by every repo under DUO_HOME, injected into both prompts
+# (Cursor only auto-loads rules from the repo it runs in, so it would never find this file on its own)
+DUO_REVIEW_GUIDE="${DUO_REVIEW_GUIDE:-$DUO_HOME/review-guide.md}"
+duo_review_guide() {
+  [ -s "$DUO_REVIEW_GUIDE" ] || return 0
+  printf 'TEAM REVIEW GUIDE (%s) — how the human reviewers of this team review merge requests.
+Apply it; it takes precedence over generic advice.
+%s
+
+' "$DUO_REVIEW_GUIDE" "$(cat "$DUO_REVIEW_GUIDE")"
+}
+
+# duo_rubric -> what to look for and how to tag findings; shared by the plan and the diff review
+duo_rubric() {
+  cat <<'EOF'
+Focus, in this order:
+1. Requirements: compare against the requirements quoted in the plan and the user's messages. Flag anything
+   missing, or built differently without a stated reason.
+2. Correctness and failure modes: bugs, unhandled errors, what happens when a dependency (storage, broker, DB,
+   network) fails midway, concurrency and thread-safety, transactions and locks.
+3. Blast radius: effects beyond the task (global state, signals, model or field behaviour, shared connections,
+   settings), and sibling code paths with the same problem that were left unfixed (search the repo for them).
+4. Tests: requirements and failure paths without a test; tests that do not exercise the change.
+5. Simplicity: over-engineering, speculative generality, unused code, defensive code for impossible states.
+   Prefer the simplest fix. Never ask for machinery "for the future".
+Skip formatting and style unless the team review guide asks for it.
+
+Tag every finding with exactly one of:
+[BLOCKER]  must change before merge: a bug, a missing requirement, data loss, a broken contract
+[SHOULD]   worth doing, not blocking
+[NIT]      minor
+[ESCALATE] a decision for the user rather than for you or Claude: a product, scope or ops trade-off, or a point
+           where you still disagree with Claude after its response. Escalating a real disagreement is expected
+           and useful; it is better than dropping the point or repeating it.
+Only [BLOCKER] makes Claude change the work before continuing. [ESCALATE] items are put to the user.
+EOF
+}
