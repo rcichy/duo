@@ -1,5 +1,5 @@
 {
-  "env": { "DUO_HOME": "__DUO_HOME__", "DUO_MODEL": "gpt-5.3-codex-high", "DUO_MAX_ROUNDS": "3" },
+  "env": { "DUO_HOME": "__DUO_HOME__", "DUO_PLAN_MODEL": "grok-4.7-high", "DUO_DIFF_MODEL": "grok-4.7-high", "DUO_MAX_ROUNDS": "3" },
   "hooks": {
     "PreToolUse": [
       { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": "__HOME__/.config/ai/duo/hooks/review-plan.sh", "timeout": 600, "statusMessage": "duo: Cursor is reviewing the plan…" } ] },

@@ -12,7 +12,17 @@ you: "implement X"  (Claude in plan mode)
                                               → LGTM: done, diff left unstaged
 ```
 
-Cursor also receives your own messages from the session (extracted from the transcript) as "TASK CONTEXT", so it judges against what you actually asked for.
+## What each reviewer is told
+
+Every Cursor call is a fresh session (no `--resume`), so each prompt carries its own context:
+
+| Section | Plan review | Diff review | Source |
+|---|---|---|---|
+| `TASK TITLE` | yes | yes | session title (`customTitle`, else `aiTitle`) |
+| `ORIGINAL REQUEST` | yes | yes | your first message this session — survives truncation |
+| `TASK CONTEXT` | yes | yes | all your typed messages, in order (tool output, skills and system reminders filtered out) |
+| `APPROVED PLAN` | — | yes | cached when the plan review returns APPROVE, so the code is checked against what was agreed |
+| `PLAN` / `DIFF` | the plan | `git diff` + untracked files | |
 
 ## Files
 
@@ -24,7 +34,7 @@ Cursor also receives your own messages from the session (extracted from the tran
 | `hooks/block-git-staging.sh` | `PreToolUse` on `Bash` — denies `git add/commit/stash/push/reset/restore` while duo is on |
 | `skills/duo-on`, `skills/duo-off` | `/duo-on` `/duo-off` — create/remove the marker file and brief Claude on the rules |
 | `hooks.settings.json` | fragment merged into `~/.claude/settings.json` by the installer |
-| `statusline-duo.snippet.sh` | adds ` \| DUO` to the status line while active |
+| `statusline-duo.snippet.sh` | adds ` \| DUO` to the status line while active (superseded by `../statusline-command.sh`) |
 | `install.sh` | idempotent installer |
 
 ## How it is scoped (important)
@@ -87,10 +97,13 @@ Set in `~/.claude/settings.json` → `env`:
 | Var | Default | Meaning |
 |---|---|---|
 | `DUO_HOME` | (set by installer) | folder under which duo may activate |
-| `DUO_MODEL` | `gpt-5.3-codex-high` | Cursor model (`agent --list-models`) |
+| `DUO_PLAN_MODEL` | `grok-4.7-high` | model for the plan review (approach, fit, missing requirements) |
+| `DUO_DIFF_MODEL` | `grok-4.7-high` | model for the diff review (bugs, contracts, tests) |
+| `DUO_MODEL` | `grok-4.7-high` | fallback used for either review when the two above are unset |
 | `DUO_MAX_ROUNDS` | `3` | cap for plan rounds and, separately, diff rounds |
-| `DUO_CTX_CHARS` | `12000` | max chars of your own messages forwarded to Cursor (most recent kept) |
-| `DUO_PLANS` | `~/.claude/plans` | where Claude Code writes plan files (only change if you set `plansDirectory`) |
+| `DUO_CTX_CHARS` | `12000` | max chars of your own messages forwarded to Cursor (most recent kept; truncation is marked) |
+| `DUO_TASK_CHARS` | `2000` | max chars of the opening request quoted in the task header |
+| `DUO_PROMPT_LOG` | unset | file to append every prompt sent to Cursor — for debugging what a reviewer actually saw |
 
 Round counters live in `/tmp/claude-duo-<session>-*`; delete them to reset a session.
 
@@ -98,9 +111,34 @@ Round counters live in `/tmp/claude-duo-<session>-*`; delete them to reset a ses
 
 Remove the three hook entries and the `env` keys from `~/.claude/settings.json` (or restore `settings.json.bak-duo`), delete the two symlinks in `~/.claude/skills/`, and remove the "duo indicator" block from the status line script.
 
+## Choosing reviewer models
+
+`agent --list-models` lists ~240 ids, shaped `<family>-<effort>[-fast]` (effort: none→low→medium→high→xhigh→max).
+
+- **Never pick a Claude model as the reviewer.** The value of this loop is independent failure modes; a same-family reviewer shares the implementer's blind spots.
+- Avoid `auto` (non-deterministic reviewer) and the Flash/Mini/Nano tiers (a reviewer that misses things manufactures false confidence).
+- `-fast` variants buy little here — hooks run while you wait anyway.
+- Usage limits are per-family on Cursor plans: if one family is exhausted, another may still work (`agent -p --model <id> "Reply OK"` is a cheap probe).
+- Notable families: Codex 5.3 (code-specialised), GPT-5.6 Sol/Terra/Luna (1M general), GPT-5.5/5.4/5.2, Grok 4.7/4.6, Gemini Flash, Kimi, GLM.
+
+## Status line
+
+`~/.config/ai/statusline-command.sh` (copy it to `~/.claude/statusline-command.sh`) renders:
+
+```
+ <dir> | <model> | Ctx: 24% (240.9k tok) | 5h 14%↺3h39m · 7d 13%↺5d | DUO grok-4.7-high | cur: grok ok
+```
+
+- **Ctx / 5h / 7d** come from the status-line JSON (`context_window`, `rate_limits.*.used_percentage` and `.resets_at`); `↺` is time until that window resets.
+- **DUO** names the configured reviewers: one id when both reviews use the same model, otherwise `<plan>-><diff>` (e.g. `DUO gpt-5.6-sol-high->gpt-5.3-codex-high`). Read from `env` in settings, so it reflects what the next review will actually use.
+- **cur:** is last-known Cursor state per model family, written by the hooks on every review (`~/.claude/duo-cursor-status.json`). Cursor publishes no usage API and its CLI has no usage command, so this is *state at the last review*, not a live percentage: `ok`, or `⛔<n>d` when that family reported a weekly limit. It only shows while duo is on. Probing Cursor to refresh it would itself consume usage.
+
 ## Known limits
 
 - The diff review sees the **whole** uncommitted diff of the repo, including your own pre-existing uncommitted work.
 - Cursor sees your messages and the plan/diff, not Claude's replies or reasoning.
 - Each Cursor call is a full agent run over the repo: expect 30 s – 3 min per review. Hook timeouts are 600 s (plan) / 900 s (diff).
+- The plan reviewed is the plan file **this session** wrote (resolved from the transcript). If that cannot be determined the plan review is skipped rather than reviewing an unrelated plan.
+- **Each Cursor call is a fresh session** — no `--resume`/`--continue`. The diff reviewer does not see the plan, and round N does not remember round N-1. Anything a reviewer must know has to be in its prompt.
+- If Cursor errors (weekly usage limit, bad model id, not logged in) the review is skipped **fail-open** — Claude proceeds and the status message quotes Cursor's error.
 - `agent` CLI flags (`-p`, `--mode ask`, `--output-format`, `--trust`) are as of Cursor CLI 2026.09; if a review returns nothing, run the `agent -p …` line from `common.sh` manually.

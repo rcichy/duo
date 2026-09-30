@@ -23,21 +23,31 @@ if [ "$ROUND" = cap ]; then
 fi
 
 CTX=$(duo_user_context)
-REVIEW=$(duo_ask "You are reviewing uncommitted changes made by another AI (Claude) in the current repository.
+HDR=$(duo_task_header)
+PLANCTX=""
+if [ -s "$DUO_PLAN_CACHE" ]; then
+  PLANCTX="APPROVED PLAN — the plan for this task, already reviewed and approved. Check the diff against it: flag anything built differently without a stated reason, and anything in the plan left unimplemented.
+$(cat "$DUO_PLAN_CACHE")
+
+"
+fi
+REVIEW=$(duo_ask "$DUO_DIFF_MODEL" "You are reviewing uncommitted changes made by another AI (Claude) in the current repository.
 Read surrounding code for context. Do NOT modify any files.
 Look for: bugs, unhandled errors, broken contracts with callers, missing or weak tests, security issues, needless complexity.
 Ignore style nits unless they hide a bug.
 Respond with EXACTLY one word on the first line: LGTM or CHANGES
 Then a concise bullet list: file:line — problem — suggested fix.
 
+$HDR
+
 TASK CONTEXT — the user's own messages to Claude, in order (the ground truth for what was asked; judge the diff against this, and flag anything the user asked for that is missing or anything done that they did not ask for):
 $CTX
 
-DIFF:
+${PLANCTX}DIFF:
 $DIFF")
 
 if [ -z "$REVIEW" ]; then
-  jq -n '{systemMessage:"duo: Cursor returned no output (check `agent login`), stopping"}'; exit 0
+  jq -n --arg e "$(duo_why_empty)" '{systemMessage:("duo: no diff review — proceeding without it. Cursor said: "+$e)}'; exit 0
 fi
 
 if head -1 <<<"$REVIEW" | grep -qi '^[[:space:]]*LGTM'; then
