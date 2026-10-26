@@ -125,7 +125,7 @@ So plain Claude is unaffected everywhere else, and unaffected in a slot until yo
 duo must live in `~/.config/ai/duo`: the skills, hooks and status-line snippet call it there.
 
 ```bash
-git clone <this repo> ~/.config/ai/duo
+git clone https://github.com/rcichy/duo.git ~/.config/ai/duo
 ```
 
 Prerequisites: Claude Code, `jq` (`brew install jq`), on macOS `coreutils` for the per-call timeout
