@@ -6,6 +6,7 @@ source "$(dirname "$0")/common.sh"
 duo_enabled || exit 0
 
 PLAN=$(jq -r '.tool_input.plan // empty' <<<"$DUO_INPUT")
+PLAN_FILE=$(jq -r '.tool_input.planFilePath // empty' <<<"$DUO_INPUT")
 if [ -z "$PLAN" ]; then
   # Resolve the plan file THIS session wrote. Never fall back to "newest plan on disk":
   # that can hand the reviewer an unrelated plan from another project or session.
@@ -25,7 +26,7 @@ ROUND=$(duo_round_status plan)
 CTX=$(duo_user_context)
 HDR=$(duo_task_header)
 REVIEW=$(duo_review "$DUO_PLAN_MODEL" "You are a senior engineer reviewing an implementation plan written by another AI (Claude).
-The repository is the current directory. Inspect the code as needed. Do NOT modify any files.
+The code is in $DUO_WHERE. Inspect it as needed. Do NOT modify any files.
 Review THIS plan only. Other work visible in the working tree or earlier in the session is out of scope unless
 this plan changes or depends on it.
 
@@ -64,6 +65,7 @@ fi
 allow() {  # $1 = reason shown to the user
   duo_reset_round plan
   printf '%s' "$PLAN" > "$DUO_PLAN_CACHE"   # the diff review checks the code against this
+  printf '%s' "${PLAN_FILE:-}" > "$DUO_PLAN_CACHE-file"   # and against later edits of this file, as deviations
   jq -n --arg r "$1" '{systemMessage:$r, hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",permissionDecisionReason:$r}}'
   exit 0
 }

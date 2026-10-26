@@ -3,7 +3,7 @@ name: btw
 description: Ask a side question during duo mode - Claude answers without sending the working diff to Cursor for review. Use when the user prefixes a message with /btw or btw, or asks something alongside the implementation (a decision, a clarification, "why did you...").
 ---
 
-!`H="${DUO_HOME:-$(jq -r ".env.DUO_HOME // empty" "$HOME/.claude/settings.json")}"; [ -n "$H" ] && mkdir -p "$H/.claude" && : > "$H/.claude/duo-aside"; echo "duo: aside - this turn is not sent to Cursor"`
+!`"$HOME/.config/ai/duo/duo-mode.sh" aside`
 
 This message is a **side question**, not a step of the implementation. For this turn:
 

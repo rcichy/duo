@@ -1,23 +1,64 @@
 #!/usr/bin/env bash
 # Shared helpers for the Claude<->Cursor "duo" review loop.
 # Hooks are registered globally (~/.claude/settings.json) but are a no-op unless BOTH hold:
-#   1. the session cwd is inside DUO_HOME (set by install.sh in settings.json "env")
-#   2. DUO_HOME/.claude/duo.on exists   (toggle with /duo-on and /duo-off)
+#   1. the session was started in a slot (git checkout) inside DUO_HOME (set by install.sh in settings.json "env")
+#   2. that slot is switched on: DUO_HOME/.claude/duo.on.d/<slot> exists (/duo-on and /duo-off, see slot.sh)
 
 DUO_HOME="${DUO_HOME:-$(jq -r '.env.DUO_HOME // empty' "$HOME/.claude/settings.json" 2>/dev/null)}"
 [ -n "$DUO_HOME" ] || exit 0
+source "$(dirname "${BASH_SOURCE[0]}")/slot.sh"
 DUO_INPUT=$(cat)
 DUO_SESSION=$(jq -r '.session_id // "nosession"' <<<"$DUO_INPUT")
 DUO_CWD=$(jq -r '.cwd // empty' <<<"$DUO_INPUT")
 [ -z "$DUO_CWD" ] && DUO_CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+DUO_SLOT_ROOT=$(duo_slot_root "${CLAUDE_PROJECT_DIR:-$DUO_CWD}" "$DUO_HOME")
 
 duo_enabled() {
-  case "$DUO_CWD/" in "$DUO_HOME"/*) ;; *) return 1 ;; esac
-  [ -f "$DUO_HOME/.claude/duo.on" ] && command -v agent >/dev/null 2>&1
+  local on
+  on=$(duo_slot_file "$DUO_HOME" "$DUO_SLOT_ROOT" duo.on) || return 1
+  [ -f "$on" ] && command -v agent >/dev/null 2>&1
 }
 
 # repo root of the current session (falls back to cwd when not in git)
 DUO_ROOT=$(cd "$DUO_CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || echo "$DUO_CWD")
+
+# A slot that is not a git checkout but holds one checkout per repo (a workspace for a task that spans several
+# repos) is reviewed as a whole: Cursor runs in the slot directory and sees the changes of every checkout in it.
+# DUO_HOME itself never counts as one, although it holds checkouts too.
+DUO_MULTI=0
+DUO_WHERE="the current repository"
+if [ "$DUO_SLOT_ROOT" != "$DUO_HOME" ] && ! git -C "$DUO_SLOT_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+   && compgen -G "$DUO_SLOT_ROOT/*/.git" >/dev/null; then
+  DUO_MULTI=1 DUO_ROOT="$DUO_SLOT_ROOT"
+  DUO_WHERE="the repositories checked out in the subdirectories of the current directory (diff paths start with the subdirectory)"
+fi
+
+# duo_checkouts -> the git checkouts a review covers, one per line: each one in a multi-repo slot, else DUO_ROOT
+duo_checkouts() {
+  local d
+  if [ "$DUO_MULTI" = 1 ]; then
+    for d in "$DUO_ROOT"/*/; do [ -e "$d.git" ] && printf '%s\n' "${d%/}"; done
+  else
+    git -C "$DUO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf '%s\n' "$DUO_ROOT"
+  fi
+  return 0
+}
+
+# duo_prefix <checkout> -> its path relative to DUO_ROOT, with a trailing slash ("" for DUO_ROOT itself)
+duo_prefix() { [ "$1" = "$DUO_ROOT" ] || printf '%s/' "${1#"$DUO_ROOT"/}"; }
+
+# duo_diff -> the uncommitted changes (tracked and untracked files) of every checkout, paths relative to DUO_ROOT
+duo_diff() {
+  local c p f
+  while IFS= read -r c; do
+    p=$(duo_prefix "$c")
+    git -C "$c" diff --src-prefix="a/$p" --dst-prefix="b/$p"
+    while IFS= read -r f; do
+      [ -n "$f" ] && (cd "$c" && git diff --no-index --src-prefix="a/$p" --dst-prefix="b/$p" /dev/null "$f" 2>/dev/null)
+    done < <(git -C "$c" ls-files --others --exclude-standard)
+  done < <(duo_checkouts)
+  return 0
+}
 
 DUO_MODEL="${DUO_MODEL:-grok-4.7-high}"          # fallback for both reviews
 DUO_PLAN_MODEL="${DUO_PLAN_MODEL:-$DUO_MODEL}"        # plan review: architectural judgement, wide repo read
@@ -80,19 +121,113 @@ duo_failure_reason() {
 # "$DUO_STATE-answers.log") for diagnosis. The call is
 # capped below the hook timeouts (1800s) so a slow reviewer is reported instead of silently killed.
 DUO_AGENT_TIMEOUT="${DUO_AGENT_TIMEOUT:-1500}"
+
+# duo_timeout_cmd <seconds> -> "timeout <s>" (GNU coreutils; "gtimeout" on macOS with brew coreutils), or nothing
+# when neither exists: the call then runs uncapped and only the hook timeout (1800s) stops it.
+duo_timeout_cmd() {
+  local t
+  for t in timeout gtimeout; do command -v "$t" >/dev/null 2>&1 && { printf '%s %s' "$t" "$1"; return 0; }; done
+  return 0
+}
 duo_ask() {
-  local model="$1" prompt="$2" out rc start limit=()
+  local model="$1" prompt="$2" out rc start limit=() stream=""
   [ -n "${DUO_PROMPT_LOG:-}" ] && printf '===== %s =====\n%s\n' "$model" "$prompt" >> "$DUO_PROMPT_LOG"
-  command -v timeout >/dev/null 2>&1 && limit=(timeout "$DUO_AGENT_TIMEOUT")
   start=$(date +%s)
-  out=$(cd "$DUO_ROOT" && "${limit[@]}" agent -p --trust --mode ask --model "$model" --output-format text "$prompt" 2>"$DUO_STATE-stderr")
-  rc=$?
+  if duo_use_herdr && duo_ask_herdr "$model" "$prompt"; then
+    out=$(cat "$DUO_STATE-herdr-out" 2>/dev/null)
+    rc=$(cat "$DUO_STATE-herdr-rc")
+    stream="$DUO_STATE-herdr-stream.jsonl"
+  else
+    read -r -a limit <<<"$(duo_timeout_cmd "$DUO_AGENT_TIMEOUT")"
+    out=$(cd "$DUO_ROOT" && ${limit[@]+"${limit[@]}"} agent -p --trust --mode ask --model "$model" --output-format text "$prompt" 2>"$DUO_STATE-stderr")
+    rc=$?
+  fi
   [ "$rc" = 124 ] && printf 'agent timed out after %ss\n' "$DUO_AGENT_TIMEOUT" >> "$DUO_STATE-stderr"
   printf '===== %s model=%s rc=%s %ss prompt=%s chars =====\n%s\n' "$(date '+%F %T')" "$model" "$rc" \
     "$(( $(date +%s) - start ))" "${#prompt}" "$out" > "$DUO_STATE-last-answer"
   cat "$DUO_STATE-last-answer" >> "$DUO_STATE-answers.log"
+  duo_archive "$prompt" "$stream"
   duo_record_cursor "$model" "$out"
   printf '%s' "$out"
+}
+
+# Every Cursor call is kept for /duo-advisor, which reads a session afterwards: what Cursor was given decides what it
+# could catch. DUO_LOG_DIR/<session>/<n>-<hook>.prompt.md is the prompt, .answer.md the answer with its header
+# line (model, exit code, duration), .reads the files Cursor read and searched (herdr runs only). An empty
+# DUO_LOG_DIR keeps nothing.
+DUO_LOG_DIR="${DUO_LOG_DIR-$HOME/.claude/duo-log}"
+
+# duo_archive <prompt> <stream file or ""> -> files the call that just ended ($DUO_STATE-last-answer) in the archive
+duo_archive() {
+  [ -n "$DUO_LOG_DIR" ] || return 0
+  local d="$DUO_LOG_DIR/$DUO_SESSION" n base
+  mkdir -p "$d" 2>/dev/null || return 0
+  n=$(find "$d" -name '*.prompt.md' 2>/dev/null | wc -l)
+  base="$d/$(printf '%03d' $((n + 1)))-$(basename "$0" .sh)"
+  printf '%s\n' "$1" > "$base.prompt.md"
+  cp "$DUO_STATE-last-answer" "$base.answer.md"
+  [ -n "$2" ] && [ -s "$2" ] && jq -Rr 'fromjson? | select(.type == "tool_call" and .subtype == "started")
+      | .tool_call | to_entries[] | select(.key | endswith("ToolCall"))
+      | "\(.key | sub("ToolCall$"; "")) \(.value.args | [.path, .pattern, .globPattern, .command] | map(select(. != null) | tostring) | join("  "))"' \
+      "$2" > "$base.reads" 2>/dev/null
+  return 0
+}
+
+# --- herdr ------------------------------------------------------------------------------------
+# With DUO_USE_HERDR=1 and Claude running inside herdr, the Cursor call runs in a herdr pane split off Claude's
+# pane, so you can watch what the reviewer reads and says. The hook still waits for the answer and handles it
+# exactly as before; herdr-run.sh hands it back through files. Outside herdr, or if the pane cannot be
+# created, the call runs directly as usual.
+DUO_USE_HERDR="${DUO_USE_HERDR:-0}"
+DUO_HERDR_SPLIT="${DUO_HERDR_SPLIT:-right}"   # where the review pane opens next to Claude: right | down
+DUO_HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+duo_use_herdr() {
+  case "$DUO_USE_HERDR" in 1|true|yes|on) ;; *) return 1 ;; esac
+  [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1
+}
+
+# duo_herdr_pane -> this session's review pane: split off Claude's pane on first use, reused afterwards,
+# recreated if you closed it
+duo_herdr_pane() {
+  local f="$DUO_STATE-herdr-pane" pane
+  pane=$(cat "$f" 2>/dev/null)
+  if [ -z "$pane" ] || ! herdr pane get "$pane" >/dev/null 2>&1; then
+    rm -f "$DUO_STATE-herdr-prompt"   # a new pane has nothing left running
+    pane=$(herdr pane split --pane "$HERDR_PANE_ID" --direction "$DUO_HERDR_SPLIT" --cwd "$DUO_ROOT" --no-focus 2>/dev/null \
+           | jq -r '.result.pane.pane_id // empty')
+    [ -n "$pane" ] || return 1
+    herdr pane rename "$pane" "duo: cursor" >/dev/null 2>&1
+    echo "$pane" > "$f"
+  fi
+  printf '%s' "$pane"
+}
+
+# duo_ask_herdr <model> <prompt> -> runs the Cursor call in the review pane and waits for it; on success the
+# answer is in "$DUO_STATE-herdr-out" and the exit code in "$DUO_STATE-herdr-rc". Fails (so the caller runs
+# Cursor directly) only when nothing was started.
+duo_ask_herdr() {
+  local model="$1" prompt="$2" pane deadline
+  pane=$(duo_herdr_pane) || return 1
+  # the previous run never finished (its hook was killed): interrupt it before typing into the pane
+  if [ -f "$DUO_STATE-herdr-prompt" ] && [ ! -f "$DUO_STATE-herdr-rc" ]; then
+    herdr pane send-keys "$pane" ctrl+c >/dev/null 2>&1; sleep 1
+  fi
+  rm -f "$DUO_STATE-herdr-rc" "$DUO_STATE-herdr-out"
+  printf '%s' "$prompt" > "$DUO_STATE-herdr-prompt"
+  herdr pane run "$pane" "$(printf '%q ' bash "$DUO_HOOKS_DIR/herdr-run.sh" "$DUO_STATE" "$model" "$DUO_ROOT" \
+    "$DUO_AGENT_TIMEOUT" "$(basename "$0" .sh)")" >/dev/null 2>&1 || return 1
+  deadline=$(( $(date +%s) + DUO_AGENT_TIMEOUT + 60 ))   # herdr-run.sh enforces the timeout; this is a backstop
+  until [ -f "$DUO_STATE-herdr-rc" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      herdr pane send-keys "$pane" ctrl+c >/dev/null 2>&1
+      printf 'herdr pane %s did not finish the review\n' "$pane" >> "$DUO_STATE-stderr"
+      echo 124 > "$DUO_STATE-herdr-rc"
+      break
+    fi
+    sleep 1
+  done
+  return 0
 }
 
 # duo_review <model> <prompt> <verdict words>... -> a review with a recognisable verdict, asking a second time when
@@ -211,12 +346,12 @@ DUO_PLAN_CACHE="$DUO_STATE-approved-plan"
 # so reviewing it would waste a Cursor call and confuse the round counter.
 DUO_ASIDE_RE="${DUO_ASIDE_RE:-^[[:space:]]*/?btw([[:space:]]|,|:|$)}"
 DUO_ASIDE_FLAG="$DUO_STATE-aside"
-DUO_ASIDE_FLAG_GLOBAL="$DUO_HOME/.claude/duo-aside"   # set by the /btw skill, which has no session id
+DUO_ASIDE_FLAG_SLOT=$(duo_slot_file "$DUO_HOME" "$DUO_SLOT_ROOT" duo-aside)   # set by the /btw skill, which has no session id
 
 # duo_aside_consume -> 0 when this turn is an aside; clears the mark so it lasts exactly one turn
 duo_aside_consume() {
-  if [ -f "$DUO_ASIDE_FLAG" ] || [ -f "$DUO_ASIDE_FLAG_GLOBAL" ]; then
-    rm -f "$DUO_ASIDE_FLAG" "$DUO_ASIDE_FLAG_GLOBAL"
+  if [ -f "$DUO_ASIDE_FLAG" ] || [ -f "$DUO_ASIDE_FLAG_SLOT" ]; then
+    rm -f "$DUO_ASIDE_FLAG" "$DUO_ASIDE_FLAG_SLOT"
     return 0
   fi
   return 1
@@ -256,6 +391,29 @@ DUO_PROSE_RE="${DUO_PROSE_RE:-\.(md|markdown|mdx|rst|txt|adoc)$}"
 DUO_PROSE_MIN_LINES="${DUO_PROSE_MIN_LINES:-5}"   # skip the pass for typo-sized prose changes
 DUO_PROSE_SKILL="${DUO_PROSE_SKILL:-no-ai-slop}"  # empty disables the gate
 
+# Rules of the team guide that a linter can check are checked on the lines the change adds, before any Cursor call:
+# old code that breaks them is no excuse for new code that does. DUO_NEW_CODE_RUFF lists ruff rule codes (e.g.
+# "ANN001,ANN201,PLC0415"); empty disables the check, and so does a missing ruff.
+# DUO_NEW_CODE_RUFF_STRICT lists the codes among them that apply even where a repo's per-file-ignores turn them off.
+# Both are read from settings.json first: a session keeps the env it started with, and the lists grow meanwhile.
+for v in DUO_NEW_CODE_RUFF DUO_NEW_CODE_RUFF_STRICT; do
+  if jq -e --arg v "$v" '.env | has($v)' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    printf -v "$v" '%s' "$(jq -r --arg v "$v" '.env[$v]' "$HOME/.claude/settings.json")"
+  fi
+done
+DUO_NEW_CODE_RUFF="${DUO_NEW_CODE_RUFF:-}" DUO_NEW_CODE_RUFF_STRICT="${DUO_NEW_CODE_RUFF_STRICT:-}"
+
+# duo_new_code_findings -> "path:line: CODE message" for each finding on an added line, paths relative to DUO_ROOT
+duo_new_code_findings() {
+  [ -n "$DUO_NEW_CODE_RUFF" ] && command -v ruff >/dev/null 2>&1 || return 0
+  local c
+  while IFS= read -r c; do
+    python3 -I "$(dirname "${BASH_SOURCE[0]}")/new-code-check.py" "$c" "$DUO_NEW_CODE_RUFF" "$(duo_prefix "$c")" \
+      "$DUO_NEW_CODE_RUFF_STRICT" 2>/dev/null
+  done < <(duo_checkouts)
+  return 0
+}
+
 # duo_prose_skill_available -> 0 when that skill is installed for this session
 duo_prose_skill_available() {
   [ -n "$DUO_PROSE_SKILL" ] || return 1
@@ -266,16 +424,20 @@ duo_prose_skill_available() {
 
 # duo_prose_pending -> changed prose files not yet handed to the editing skill, one per line
 duo_prose_pending() {
-  local tracked untracked changed added=0 f
-  tracked=$(git diff --name-only 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
-  untracked=$(git ls-files --others --exclude-standard 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
-  changed=$(printf '%s\n%s\n' "$tracked" "$untracked" | sed '/^$/d' | sort -u)
+  local c p tracked untracked changed="" added=0 f
+  while IFS= read -r c; do
+    p=$(duo_prefix "$c")
+    tracked=$(git -C "$c" diff --name-only 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
+    untracked=$(git -C "$c" ls-files --others --exclude-standard 2>/dev/null | grep -Ei "$DUO_PROSE_RE" || true)
+    changed+=$(printf '%s\n%s\n' "$tracked" "$untracked" | sed "/^\$/d; s|^|$p|")$'\n'
+    added=$(( added + $(git -C "$c" diff --numstat 2>/dev/null | grep -Ei "$DUO_PROSE_RE" | awk '{s+=$1} END{print s+0}') ))
+    while IFS= read -r f; do
+      [ -n "$f" ] && added=$(( added + $(wc -l < "$c/$f" 2>/dev/null || echo 0) ))
+    done <<<"$untracked"
+  done < <(duo_checkouts)
+  changed=$(sed '/^$/d' <<<"$changed" | sort -u)
   [ -n "$changed" ] || return 0
-  added=$(git diff --numstat 2>/dev/null | grep -Ei "$DUO_PROSE_RE" | awk '{s+=$1} END{print s+0}')
-  while IFS= read -r f; do
-    [ -n "$f" ] && added=$(( added + $(wc -l < "$f" 2>/dev/null || echo 0) ))
-  done <<<"$untracked"
-  [ "${added:-0}" -ge "$DUO_PROSE_MIN_LINES" ] || return 0
+  [ "$added" -ge "$DUO_PROSE_MIN_LINES" ] || return 0
   comm -23 <(printf '%s\n' "$changed") <(sort -u "$DUO_STATE-prose-done" 2>/dev/null)
 }
 
@@ -323,23 +485,33 @@ duo_rubric() {
   cat <<'EOF'
 Focus, in this order:
 1. Requirements: compare against the requirements quoted in the plan and the user's messages. Flag anything
-   missing, or built differently without a stated reason.
+   missing, or built differently without a stated reason. Check each behaviour the plan states (an order, an empty
+   case, which rows a count includes) against the requirements and design decisions it quotes: a statement that
+   contradicts them is a [BLOCKER], even when the plan calls it intended.
 2. Correctness and failure modes: bugs, unhandled errors, what happens when a dependency (storage, broker, DB,
-   network) fails midway, concurrency and thread-safety, transactions and locks.
+   network) fails midway, concurrency and thread-safety, transactions and locks. Trace the empty cases (NULL, empty
+   string, empty list or array, no rows) through every new sort, filter and aggregate. A helper must not change
+   what it is given (a query, a list, a dict) unless that is its job.
 3. Blast radius: effects beyond the task (global state, signals, model or field behaviour, shared connections,
    settings), and sibling code paths with the same problem that were left unfixed (search the repo for them).
 4. Tests: requirements and failure paths without a test; tests that do not exercise the change.
 5. Simplicity: over-engineering, speculative generality, unused code, defensive code for impossible states.
    Prefer the simplest fix. Never ask for machinery "for the future".
-Skip formatting and style unless the team review guide asks for it.
+6. Team review guide, when there is one: go through it rule by rule against the plan or the added lines. A clear
+   breach of a guide rule in new code is a [BLOCKER]: the team's reviewers would ask for it anyway, and it is cheap
+   to fix now. The surrounding code breaking the same rule is no excuse; only a reason the guide itself accepts is.
+Skip formatting and style the team review guide does not ask for.
 
 Tag every finding with exactly one of:
 [BLOCKER]  must change before merge: a bug, a missing requirement, data loss, a broken contract
 [SHOULD]   worth doing, not blocking
 [NIT]      minor
-[ESCALATE] a decision for the user rather than for you or Claude: a product, scope or ops trade-off, or a point
-           where you still disagree with Claude after its response. Escalating a real disagreement is expected
-           and useful; it is better than dropping the point or repeating it.
+[ESCALATE] a decision for the user rather than for you or Claude: a product, scope or ops trade-off (including
+           a deviation that changes what users see, such as a count, a filter result or an order, compared with
+           the ticket, its design documents or another screen), or a point where you still disagree with Claude
+           after its response. Escalating a real disagreement is expected and useful; it is better than dropping
+           the point or repeating it. Never escalate again what the user already decided (their answers to
+           Claude's questions are in TASK CONTEXT) unless you bring new evidence, and name it.
 Only [BLOCKER] makes Claude change the work before continuing. [ESCALATE] items are put to the user.
 EOF
 }

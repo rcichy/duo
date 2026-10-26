@@ -15,7 +15,12 @@ need jq "brew install jq"
 need claude "install Claude Code first"
 command -v agent >/dev/null 2>&1 || echo "WARN: Cursor CLI 'agent' not found. Install: curl https://cursor.com/install -fsS | bash ; then: agent login"
 
-chmod +x "$DUO_DIR"/hooks/*.sh
+chmod +x "$DUO_DIR"/hooks/*.sh "$DUO_DIR"/duo-mode.sh
+
+# the skills and the status-line snippet call ~/.config/ai/duo/duo-mode.sh, and the hooks are registered there
+[ "$DUO_DIR" = "$HOME/.config/ai/duo" ] || echo "WARN: duo lives in $DUO_DIR, but its skills, hooks and status-line snippet expect $HOME/.config/ai/duo. Clone it there (or symlink that path to $DUO_DIR)."
+command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
+  || echo "WARN: no 'timeout' command; Cursor calls will not be capped by DUO_AGENT_TIMEOUT (macOS: brew install coreutils)"
 
 # 1. settings.json: env + hooks (merged, never replaces existing entries)
 mkdir -p "$HOME/.claude"; [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
@@ -34,10 +39,10 @@ jq -e '.hooks.PreToolUse[]|select(.matcher=="ExitPlanMode")' "$SETTINGS" >/dev/n
 
 # 2. skills: symlink so git pulls update them
 mkdir -p "$SKILLS"
-for s in duo-on duo-off; do
-  [ -L "$SKILLS/$s" ] || { rm -rf "$SKILLS/$s"; ln -s "$DUO_DIR/skills/$s" "$SKILLS/$s"; }
+for s in duo-on duo-off btw duo-advisor duo-stats; do
+  [ -L "$SKILLS/$s" ] || { rm -rf "${SKILLS:?}/$s"; ln -s "$DUO_DIR/skills/$s" "$SKILLS/$s"; }
 done
-echo "ok: /duo-on and /duo-off skills linked into $SKILLS"
+echo "ok: /duo-on, /duo-off, /btw, /duo-advisor and /duo-stats skills linked into $SKILLS"
 
 # 3. status line indicator
 if [ -f "$STATUSLINE" ] && ! grep -q 'duo indicator' "$STATUSLINE"; then
@@ -57,9 +62,6 @@ elif [ ! -f "$STATUSLINE" ]; then
 else
   echo "ok: status line already patched"
 fi
-
-# 4. cleanup of the pre-canonical location (first laptop only)
-[ -d "$DUO_HOME/.claude/hooks" ] && [ -f "$DUO_HOME/.claude/hooks/common.sh" ] && { rm -rf "$DUO_HOME/.claude/hooks"; echo "ok: removed legacy $DUO_HOME/.claude/hooks"; }
 
 echo
 echo "DUO_HOME=$DUO_HOME. Open a Claude session under it and run /duo-on. If hooks don't fire in an already-open session, run /hooks there or restart it."
